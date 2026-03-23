@@ -87,18 +87,20 @@ claude --dangerously-load-development-channels server:slack
 
 ## 別のプロジェクトから参照
 
-`.mcp.json` に絶対パスで追加:
+プロジェクトの `.mcp.json` または `~/.claude.json` に追加:
 
 ```json
 {
   "mcpServers": {
     "slack": {
       "command": "bun",
-      "args": ["C:/path/to/claude-slack-channel/server.ts"]
+      "args": ["run", "--cwd", "C:\\path\\to\\claude-slack-channel", "--shell=bun", "--silent", "start"]
     }
   }
 }
 ```
+
+> **重要:** `"args": ["C:/path/to/server.ts"]` のように直接パスを指定すると、Bun が生成する User-Agent に非 ASCII 文字が含まれ、Slack API 呼び出しが失敗します。`bun run --cwd <dir> start` 形式を使ってください。
 
 ## 環境変数による設定
 
