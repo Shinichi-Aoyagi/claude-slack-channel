@@ -1,0 +1,12 @@
+{
+  "name": "claude-slack-channel",
+  "version": "0.0.1",
+  "description": "Claude Code Channels plugin for Slack",
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "@slack/bolt": "latest"
+  }
+}
