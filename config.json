@@ -1,4 +1,6 @@
 {
   "channels": [],
-  "allowFrom": []
+  "allowFrom": [],
+  "permissionApprovers": [],
+  "permissionChannel": ""
 }
