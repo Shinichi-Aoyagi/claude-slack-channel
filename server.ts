@@ -8,6 +8,16 @@ import {
 import { App, LogLevel } from "@slack/bolt";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, basename } from "path";
+import { z } from "zod";
+import {
+  parsePermissionReply,
+  computePermissionRelayEnabled,
+  shouldRoutePermissionReply,
+  decidePermissionReplyAction,
+  buildPermissionBlocks,
+  buildVerdictUpdateBlocks,
+  buildStaleUpdateBlocks,
+} from "./permission-relay";
 
 // Load config (config.json provides defaults, env vars override)
 const configPath = join(import.meta.dir, "config.json");
@@ -55,6 +65,26 @@ const allowFromList: string[] = process.env.SLACK_ALLOW_FROM
 const allowFrom = new Set(allowFromList);
 const shouldGate = allowFrom.size > 0;
 
+// Permission relay: separate allowlist + dedicated channel. Both required to enable.
+const permissionApproversList: string[] = process.env.SLACK_PERMISSION_APPROVERS
+  ? process.env.SLACK_PERMISSION_APPROVERS.split(",").map((s) => s.trim()).filter(Boolean)
+  : (config.permissionApprovers ?? []);
+const permissionApprovers = new Set(permissionApproversList);
+
+const permissionChannel: string = (
+  process.env.SLACK_PERMISSION_CHANNEL ?? config.permissionChannel ?? ""
+).trim();
+
+const permissionRelayState = computePermissionRelayEnabled(
+  permissionApprovers,
+  permissionChannel,
+);
+const permissionRelayEnabled = permissionRelayState.enabled;
+
+// pending permission requests (request_id -> Slack message coordinates)
+// Claimed atomically via get+delete before emitting verdicts (see plan §4).
+const pendingPermissions = new Map<string, { channel: string; ts: string }>();
+
 // Inbox directory for downloaded files
 const inboxDir = join(import.meta.dir, "inbox");
 mkdirSync(inboxDir, { recursive: true });
@@ -62,12 +92,26 @@ mkdirSync(inboxDir, { recursive: true });
 // stderr for debug logging (stdout is reserved for MCP stdio)
 const log = (msg: string) => console.error(`[slack-channel] ${msg}`);
 
-// Create MCP server
+// Log permission relay status
+if (permissionRelayEnabled) {
+  log(
+    `permission relay enabled (channel=${permissionChannel}, approvers=${permissionApprovers.size} users)`,
+  );
+} else {
+  log(`permission relay disabled: ${(permissionRelayState as { reason: string }).reason}`);
+}
+
+// Create MCP server. capabilities.experimental['claude/channel/permission'] is
+// only declared when sender gating is in place (docs: "Only declare the
+// capability if your channel authenticates the sender").
 const mcp = new Server(
   { name: "slack", version: "0.0.1" },
   {
     capabilities: {
-      experimental: { "claude/channel": {} },
+      experimental: {
+        "claude/channel": {},
+        ...(permissionRelayEnabled ? { "claude/channel/permission": {} } : {}),
+      },
       tools: {},
     },
     instructions: [
@@ -225,11 +269,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   throw new Error(`unknown tool: ${req.params.name}`);
 });
 
-// Connect MCP to Claude Code
-await mcp.connect(new StdioServerTransport());
-log("MCP connected");
-
-// Create Slack app with Socket Mode
+// ========== Create Slack app (moved up so permission handlers can reference it) ==========
 const slackApp = new App({
   token: botToken,
   appToken: appToken,
@@ -250,8 +290,121 @@ const slackApp = new App({
 // Get bot's own user ID to ignore self-messages
 let botUserId: string | undefined;
 
+// ========== Permission relay: MCP notification handler (registered before mcp.connect) ==========
+if (permissionRelayEnabled) {
+  const PermissionRequestSchema = z.object({
+    method: z.literal("notifications/claude/channel/permission_request"),
+    params: z.object({
+      request_id: z.string(),
+      tool_name: z.string(),
+      description: z.string(),
+      input_preview: z.string(),
+    }),
+  });
+
+  mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
+    try {
+      const blocks = buildPermissionBlocks(params, Array.from(permissionApprovers));
+      const result = await slackApp.client.chat.postMessage({
+        channel: permissionChannel,
+        text: `Claude wants to run ${params.tool_name}: ${params.description}`,
+        blocks: blocks as any,
+      });
+      if (result.ts) {
+        pendingPermissions.set(params.request_id, {
+          channel: permissionChannel,
+          ts: result.ts as string,
+        });
+        log(
+          `permission request posted (request_id=${params.request_id}, tool=${params.tool_name})`,
+        );
+      } else {
+        log(`permission request post returned no ts for ${params.request_id}`);
+      }
+    } catch (e) {
+      log(`permission request post failed: ${e}`);
+    }
+  });
+}
+
+// ========== Permission relay: Slack button action handlers ==========
+if (permissionRelayEnabled) {
+  for (const [actionId, verdict] of [
+    ["permission_allow", "allow"],
+    ["permission_deny", "deny"],
+  ] as const) {
+    slackApp.action(actionId, async ({ body, ack, respond, client }) => {
+      await ack();
+      const b = body as any;
+      const userId: string | undefined = b.user?.id;
+      const requestId: string = b.actions?.[0]?.value ?? "";
+      const msgChannel: string | undefined = b.channel?.id;
+      const msgTs: string | undefined = b.message?.ts;
+
+      if (!userId || !requestId || !msgChannel || !msgTs) {
+        log("button action received with malformed payload");
+        return;
+      }
+
+      const decision = decidePermissionReplyAction({
+        userId,
+        approvers: permissionApprovers,
+        pendingHas: pendingPermissions.has(requestId),
+      });
+
+      if (decision.kind === "forbidden") {
+        try {
+          await respond({ response_type: "ephemeral", text: "権限がありません" });
+        } catch (e) {
+          log(`ephemeral respond failed: ${e}`);
+        }
+        return;
+      }
+
+      // Atomic claim (race-safe): get+delete BEFORE emitting verdict
+      const entry = pendingPermissions.get(requestId);
+      if (!entry) {
+        try {
+          await client.chat.update({
+            channel: msgChannel,
+            ts: msgTs,
+            text: "期限切れ or 既に処理済み",
+            blocks: buildStaleUpdateBlocks() as any,
+          });
+        } catch (e) {
+          log(`chat.update (stale) failed: ${e}`);
+        }
+        return;
+      }
+      pendingPermissions.delete(requestId);
+
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel/permission",
+          params: { request_id: requestId, behavior: verdict },
+        });
+      } catch (e) {
+        log(`verdict notification failed: ${e}`);
+      }
+
+      try {
+        await client.chat.update({
+          channel: entry.channel,
+          ts: entry.ts,
+          text: `${verdict === "allow" ? "許可" : "拒否"} by <@${userId}>`,
+          blocks: buildVerdictUpdateBlocks(userId, verdict, "button") as any,
+        });
+      } catch (e) {
+        log(`chat.update (verdict) failed: ${e}`);
+      }
+
+      log(`button verdict: ${verdict} for ${requestId} by ${userId}`);
+    });
+  }
+}
+
 // Listen for messages
-slackApp.message(async ({ message, say }) => {
+slackApp.message(async ({ message }) => {
   // Skip system subtypes (message_changed, message_deleted, etc.)
   // but allow file_share (messages with attachments)
   if (message.subtype && message.subtype !== "file_share") return;
@@ -261,6 +414,79 @@ slackApp.message(async ({ message, say }) => {
 
   // Ignore own messages
   if (message.user === botUserId) return;
+
+  // Permission reply routing: checked BEFORE channelFilter/allowFrom so that
+  // permissionChannel (which may not be in SLACK_CHANNELS) still works for text fallback.
+  if (
+    shouldRoutePermissionReply({
+      channel: message.channel,
+      permissionChannel,
+      permissionRelayEnabled,
+    })
+  ) {
+    const incomingText = ("text" in message && message.text) ? message.text : "";
+    const parsed = parsePermissionReply(incomingText);
+    if (parsed) {
+      const messageTs = "ts" in message ? (message.ts as string) : "";
+      const decision = decidePermissionReplyAction({
+        userId: message.user,
+        approvers: permissionApprovers,
+        pendingHas: pendingPermissions.has(parsed.requestId),
+      });
+
+      if (decision.kind === "forbidden") {
+        try {
+          await slackApp.client.chat.postMessage({
+            channel: message.channel,
+            text: "権限がありません",
+            ...(messageTs ? { thread_ts: messageTs } : {}),
+          });
+        } catch (e) {
+          log(`thread reply (forbidden) failed: ${e}`);
+        }
+        return;
+      }
+
+      const entry = pendingPermissions.get(parsed.requestId);
+      if (!entry) {
+        try {
+          await slackApp.client.chat.postMessage({
+            channel: message.channel,
+            text: "⏰ このリクエストは期限切れか既に処理済みです",
+            ...(messageTs ? { thread_ts: messageTs } : {}),
+          });
+        } catch (e) {
+          log(`thread reply (stale) failed: ${e}`);
+        }
+        return;
+      }
+      pendingPermissions.delete(parsed.requestId);
+
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel/permission",
+          params: { request_id: parsed.requestId, behavior: parsed.verdict },
+        });
+      } catch (e) {
+        log(`verdict notification failed: ${e}`);
+      }
+
+      try {
+        await slackApp.client.chat.update({
+          channel: entry.channel,
+          ts: entry.ts,
+          text: `${parsed.verdict === "allow" ? "許可" : "拒否"} by <@${message.user}>`,
+          blocks: buildVerdictUpdateBlocks(message.user, parsed.verdict, "text") as any,
+        });
+      } catch (e) {
+        log(`chat.update (text verdict) failed: ${e}`);
+      }
+
+      log(`text verdict: ${parsed.verdict} for ${parsed.requestId} by ${message.user}`);
+      return;
+    }
+    // Not a permission reply → fall through to normal chat routing below
+  }
 
   // Gate by channel filter
   if (shouldFilterChannels && !channelFilterSet.has(message.channel)) return;
@@ -302,7 +528,11 @@ slackApp.message(async ({ message, say }) => {
   });
 });
 
-// Start the app
+// Connect MCP to Claude Code (after all handlers are registered)
+await mcp.connect(new StdioServerTransport());
+log("MCP connected");
+
+// Start Slack app
 await slackApp.start();
 
 // Get bot user ID
