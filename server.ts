@@ -354,7 +354,7 @@ if (permissionRelayEnabled) {
 
       if (decision.kind === "forbidden") {
         try {
-          await respond({ response_type: "ephemeral", text: "権限がありません" });
+          await respond({ response_type: "ephemeral", text: `許可されたユーザーではありません（あなたのUser ID: ${userId}）。SLACK_PERMISSION_APPROVERSを確認してください` });
         } catch (e) {
           log(`ephemeral respond failed: ${e}`);
         }
@@ -415,15 +415,32 @@ slackApp.message(async ({ message }) => {
   // Ignore own messages
   if (message.user === botUserId) return;
 
-  // Permission reply routing: checked BEFORE channelFilter/allowFrom so that
-  // permissionChannel (which may not be in SLACK_CHANNELS) still works for text fallback.
-  if (
-    shouldRoutePermissionReply({
-      channel: message.channel,
-      permissionChannel,
-      permissionRelayEnabled,
-    })
-  ) {
+  // Test command: "!test-permission" posts a dummy permission prompt
+  if (permissionRelayEnabled && ("text" in message) && message.text?.trim() === "!test-permission") {
+    const testId = Array.from({ length: 5 }, () => "abcdefghijkmnopqrstuvwxyz"[Math.floor(Math.random() * 25)]).join("");
+    const testParams = {
+      request_id: testId,
+      tool_name: "Bash",
+      description: "テスト用パーミッションリクエスト（実際のClaude Codeには接続されません）",
+      input_preview: "git status",
+    };
+    const blocks = buildPermissionBlocks(testParams, Array.from(permissionApprovers));
+    const result = await slackApp.client.chat.postMessage({
+      channel: permissionChannel,
+      text: `Claude wants to run ${testParams.tool_name}: ${testParams.description}`,
+      blocks: blocks as any,
+    });
+    if (result.ts) {
+      pendingPermissions.set(testId, { channel: permissionChannel, ts: result.ts as string });
+      log(`test permission request posted (id=${testId})`);
+    }
+    return;
+  }
+
+  // Permission reply routing: checked BEFORE channelFilter/allowFrom.
+  // Channel restriction removed — security is provided by permissionApprovers check
+  // and unpredictable 5-char request IDs (~25^5 combinations).
+  if (permissionRelayEnabled) {
     const incomingText = ("text" in message && message.text) ? message.text : "";
     const parsed = parsePermissionReply(incomingText);
     if (parsed) {
@@ -438,7 +455,7 @@ slackApp.message(async ({ message }) => {
         try {
           await slackApp.client.chat.postMessage({
             channel: message.channel,
-            text: "権限がありません",
+            text: `許可されたユーザーではありません（あなたのUser ID: ${message.user}）。SLACK_PERMISSION_APPROVERSを確認してください`,
             ...(messageTs ? { thread_ts: messageTs } : {}),
           });
         } catch (e) {

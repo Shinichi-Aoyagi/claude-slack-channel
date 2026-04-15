@@ -23,11 +23,18 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
  * Parse a user's text reply into a verdict + requestId.
  * Returns null for anything that isn't a valid permission reply, so the caller
  * can fall through to normal chat routing.
+ *
+ * Normalizes before matching: strips backticks/smart-quotes Slack may inject
+ * when copy-pasting, and replaces non-breaking spaces (U+00A0) with regular spaces.
  */
 export function parsePermissionReply(
   text: string,
 ): { verdict: PermissionVerdict; requestId: string } | null {
-  const m = PERMISSION_REPLY_RE.exec(text);
+  const normalized = text
+    .replace(/[`\u2018\u2019\u201c\u201d]/g, "")
+    .replace(/\u00a0/g, " ")
+    .trim();
+  const m = PERMISSION_REPLY_RE.exec(normalized);
   if (!m) return null;
   const verb = m[1].toLowerCase();
   const requestId = m[2].toLowerCase();
@@ -134,7 +141,7 @@ export function buildPermissionBlocks(
         {
           type: "mrkdwn",
           text:
-            `承認可能: ${approverMentions} または \`yes ${req.request_id}\` / \`no ${req.request_id}\` をこのチャンネルで返信`,
+            `承認可能: ${approverMentions} | ボタンクリックまたは yes ${req.request_id} / no ${req.request_id} をこのチャンネルで返信`,
         },
       ],
     },
